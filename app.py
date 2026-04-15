@@ -1,14 +1,37 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+"""
+ITBI BH — Análise Competitiva de Imóveis
+Streamlit app for competitive real-estate analysis using official
+ITBI transaction data from the Prefeitura de Belo Horizonte.
+"""
+from __future__ import annotations
+
+import base64
 import json
 import os
-import base64
+from typing import Optional
+from urllib.parse import urlparse
+
 import anthropic
 import openai as openai_lib
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 from duckduckgo_search import DDGS
+from plotly.subplots import make_subplots
+
+# ─── Constants ─────────────────────────────────────────────────────────────────
+
+DATA_PATH            = os.path.join(os.path.dirname(__file__), "itbi_2008_2026.parquet")
+MAX_PHOTOS_PER_AD    = 6      # photos stored per listing
+MAX_IMAGES_IN_PROMPT = 8      # images sent to LLM (cost/token guard)
+MAX_IMAGE_MB         = 4.0    # max size per uploaded image
+ITBI_RECENT_YEARS    = 2      # lookback for "recent market" stats
+MAX_SEARCH_LOOPS     = 8      # tool-call rounds for web search
+MAX_HIST_FOR_PROMPT  = 12     # ITBI rows included in AI prompt
+MAX_ONLINE_IN_PROMPT = 10     # online listings included in AI prompt
+
+CLAUDE_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
+GPT_MODELS    = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
 
 # ─── Page config ───────────────────────────────────────────────────────────────
 
@@ -17,22 +40,49 @@ st.set_page_config(
     page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={
+        "Get help": "https://github.com/luxeredias/itbi-belo-horizonte",
+        "Report a bug": "https://github.com/luxeredias/itbi-belo-horizonte/issues",
+        "About": "Análise competitiva de imóveis em BH usando dados oficiais de ITBI (2008–2026).",
+    },
 )
 
-DATA_PATH = os.path.join(os.path.dirname(__file__), "itbi_2008_2026.parquet")
+# ─── Secrets / API key helpers ─────────────────────────────────────────────────
+
+def get_default_api_key(provider: str) -> str:
+    """Return API key from st.secrets (Streamlit Cloud) or env var (local dev)."""
+    key = "ANTHROPIC_API_KEY" if provider == "Claude" else "OPENAI_API_KEY"
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.environ.get(key, "")
 
 # ─── Data loading ──────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Carregando base ITBI (501 k transações)...")
-def load_data() -> pd.DataFrame:
-    df = pd.read_parquet(DATA_PATH)
-    df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
-    for col in ("valor_declarado", "valor_base_calculo", "valor_m2",
-                "area_construida_adquirida", "area_adquirida_unidades_somadas"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["building_key"] = df["endereco"].str.split(" - ").str[0].str.strip()
-    df["building_key_norm"] = df["building_key"].str.upper()
-    return df
+def load_data() -> Optional[pd.DataFrame]:
+    if not os.path.exists(DATA_PATH):
+        st.error(
+            f"Arquivo de dados não encontrado: `{DATA_PATH}`. "
+            "Certifique-se de que `itbi_2008_2026.parquet` está na raiz do repositório."
+        )
+        return None
+    try:
+        df = pd.read_parquet(DATA_PATH)
+        df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
+        for col in (
+            "valor_declarado", "valor_base_calculo", "valor_m2",
+            "area_construida_adquirida", "area_adquirida_unidades_somadas",
+        ):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["building_key"]      = df["endereco"].str.split(" - ").str[0].str.strip()
+        df["building_key_norm"] = df["building_key"].str.upper()
+        return df
+    except Exception as exc:
+        st.error(f"Erro ao carregar base de dados: {exc}")
+        return None
 
 # ─── Search helpers ────────────────────────────────────────────────────────────
 
@@ -50,35 +100,58 @@ def get_building_df(df: pd.DataFrame, building_key: str) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
+# ─── Validation helpers ────────────────────────────────────────────────────────
+
+def is_valid_url(url: str) -> bool:
+    """Accept only http/https URLs to prevent markdown injection."""
+    try:
+        r = urlparse(url)
+        return r.scheme in ("http", "https") and bool(r.netloc)
+    except Exception:
+        return False
+
+def fmt_r(val) -> str:
+    return f"R$ {val:,.0f}" if pd.notna(val) and val else "–"
+
+def fmt_m2(val) -> str:
+    return f"{val:.1f} m²" if pd.notna(val) and val else "–"
+
 # ─── Photo helpers ─────────────────────────────────────────────────────────────
 
-def file_to_base64(uploaded_file) -> dict:
-    data = base64.b64encode(uploaded_file.read()).decode("utf-8")
+def file_to_base64(uploaded_file) -> Optional[dict]:
+    """Convert an uploaded file to a base64 dict; returns None if oversized."""
+    size_mb = uploaded_file.size / (1024 * 1024)
+    if size_mb > MAX_IMAGE_MB:
+        st.warning(
+            f"'{uploaded_file.name}' ({size_mb:.1f} MB) excede o limite de "
+            f"{MAX_IMAGE_MB:.0f} MB por imagem e foi ignorada."
+        )
+        return None
+    try:
+        data = base64.b64encode(uploaded_file.read()).decode("utf-8")
+    except Exception as exc:
+        st.warning(f"Não foi possível ler '{uploaded_file.name}': {exc}")
+        return None
     name = uploaded_file.name.lower()
     if name.endswith(".png"):
         media_type = "image/png"
     elif name.endswith(".webp"):
         media_type = "image/webp"
-    elif name.endswith(".gif"):
-        media_type = "image/gif"
     else:
         media_type = "image/jpeg"
     return {"data": data, "media_type": media_type, "name": uploaded_file.name}
 
-def display_photos_grid(photos: list[dict], cols: int = 3):
+def display_photos_grid(photos: list[dict], cols: int = 3) -> None:
     if not photos:
         return
-    chunks = [photos[i:i+cols] for i in range(0, len(photos), cols)]
+    chunks = [photos[i : i + cols] for i in range(0, len(photos), cols)]
     for chunk in chunks:
         c_list = st.columns(cols)
         for j, photo in enumerate(chunk):
             img_bytes = base64.b64decode(photo["data"])
             c_list[j].image(img_bytes, caption=photo.get("name", ""), use_container_width=True)
 
-# ─── AI providers + web search ────────────────────────────────────────────────
-
-CLAUDE_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
-GPT_MODELS    = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+# ─── AI — web search ───────────────────────────────────────────────────────────
 
 _SEARCH_PROMPT = (
     "Pesquise anúncios de imóveis à venda no endereço ou nas proximidades de:\n{address}\nBelo Horizonte, MG\n\n"
@@ -96,8 +169,8 @@ def ddg_search(query: str, max_results: int = 8) -> list[dict]:
                 {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
                 for r in ddgs.text(query, max_results=max_results)
             ]
-    except Exception as e:
-        return [{"error": str(e)}]
+    except Exception as exc:
+        return [{"error": str(exc)}]
 
 def _parse_listings_json(raw: str) -> tuple[list[dict], str]:
     try:
@@ -121,7 +194,7 @@ def _search_listings_claude(address: str, api_key: str, model: str) -> tuple[lis
         },
     }]
     messages = [{"role": "user", "content": _SEARCH_PROMPT.format(address=address)}]
-    for _ in range(8):
+    for _ in range(MAX_SEARCH_LOOPS):
         response = client.messages.create(model=model, max_tokens=4096, tools=tools, messages=messages)
         if response.stop_reason == "end_turn":
             raw = next((b.text for b in response.content if hasattr(b, "text")), "")
@@ -155,7 +228,7 @@ def _search_listings_gpt(address: str, api_key: str, model: str) -> tuple[list[d
         },
     }]
     messages = [{"role": "user", "content": _SEARCH_PROMPT.format(address=address)}]
-    for _ in range(8):
+    for _ in range(MAX_SEARCH_LOOPS):
         response = client.chat.completions.create(
             model=model, max_tokens=4096, tools=tools, tool_choice="auto", messages=messages,
         )
@@ -164,7 +237,7 @@ def _search_listings_gpt(address: str, api_key: str, model: str) -> tuple[list[d
             return _parse_listings_json(choice.message.content or "")
         if choice.finish_reason == "tool_calls":
             messages.append(choice.message)
-            for tc in (choice.message.tool_calls or []):
+            for tc in choice.message.tool_calls or []:
                 if tc.function.name == "search_web":
                     args = json.loads(tc.function.arguments)
                     results = ddg_search(args["query"])
@@ -175,12 +248,21 @@ def _search_listings_gpt(address: str, api_key: str, model: str) -> tuple[list[d
                     })
     return [], "Limite de buscas atingido."
 
-def search_listings(address: str, provider: str, api_key: str, model: str) -> tuple[list[dict], str]:
-    if provider == "Claude":
-        return _search_listings_claude(address, api_key, model)
-    return _search_listings_gpt(address, api_key, model)
+def search_listings(
+    address: str, provider: str, api_key: str, model: str
+) -> tuple[list[dict], str]:
+    try:
+        if provider == "Claude":
+            return _search_listings_claude(address, api_key, model)
+        return _search_listings_gpt(address, api_key, model)
+    except anthropic.AuthenticationError:
+        return [], "Erro: Anthropic API key inválida."
+    except openai_lib.AuthenticationError:
+        return [], "Erro: OpenAI API key inválida."
+    except Exception as exc:
+        return [], f"Erro na busca: {exc}"
 
-# ─── Competitive analysis ──────────────────────────────────────────────────────
+# ─── AI — competitive analysis ─────────────────────────────────────────────────
 
 def _ad_text_block(ad: dict, label: str = "") -> str:
     parts = []
@@ -216,42 +298,49 @@ def _build_competitive_prompt(
 ) -> str:
     building_key = building_df["building_key"].iloc[0] if len(building_df) > 0 else "N/A"
 
-    valid_m2 = building_df["valor_m2"].dropna()
-    valid_total = building_df["valor_declarado"].dropna()
-    avg_m2 = valid_m2.mean() if not valid_m2.empty else None
-    median_m2 = valid_m2.median() if not valid_m2.empty else None
-    p25_m2 = valid_m2.quantile(0.25) if not valid_m2.empty else None
-    p75_m2 = valid_m2.quantile(0.75) if not valid_m2.empty else None
-    date_min = str(building_df["data_quitacao"].min())[:10] if len(building_df) > 0 else "N/A"
-    date_max = str(building_df["data_quitacao"].max())[:10] if len(building_df) > 0 else "N/A"
+    valid_m2    = building_df["valor_m2"].dropna()
+    avg_m2      = valid_m2.mean()      if not valid_m2.empty else None
+    median_m2   = valid_m2.median()    if not valid_m2.empty else None
+    p25_m2      = valid_m2.quantile(0.25) if not valid_m2.empty else None
+    p75_m2      = valid_m2.quantile(0.75) if not valid_m2.empty else None
+    date_min    = str(building_df["data_quitacao"].min())[:10] if len(building_df) > 0 else "N/A"
+    date_max    = str(building_df["data_quitacao"].max())[:10] if len(building_df) > 0 else "N/A"
 
-    recent_cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
-    recent = building_df[building_df["data_quitacao"] >= recent_cutoff].copy()
-    recent_m2 = recent["valor_m2"].dropna()
+    recent_cutoff = pd.Timestamp.now() - pd.DateOffset(years=ITBI_RECENT_YEARS)
+    recent_m2     = building_df[building_df["data_quitacao"] >= recent_cutoff]["valor_m2"].dropna()
+    n_recent      = len(building_df[building_df["data_quitacao"] >= recent_cutoff])
 
-    hist = []
-    for _, row in building_df.head(12).iterrows():
-        hist.append({
-            "data": str(row.get("data_quitacao", ""))[:10],
+    hist = [
+        {
+            "data":    str(row.get("data_quitacao", ""))[:10],
             "unidade": str(row.get("endereco", "")),
-            "valor": float(row["valor_declarado"]) if pd.notna(row.get("valor_declarado")) else None,
+            "valor":   float(row["valor_declarado"])          if pd.notna(row.get("valor_declarado"))          else None,
             "area_m2": float(row["area_construida_adquirida"]) if pd.notna(row.get("area_construida_adquirida")) else None,
-            "valor_m2": float(row["valor_m2"]) if pd.notna(row.get("valor_m2")) else None,
-            "andar": str(row["andar"]) if pd.notna(row.get("andar")) else None,
-        })
+            "valor_m2":float(row["valor_m2"])                 if pd.notna(row.get("valor_m2"))                 else None,
+            "andar":   str(row["andar"])                      if pd.notna(row.get("andar"))                    else None,
+        }
+        for _, row in building_df.head(MAX_HIST_FOR_PROMPT).iterrows()
+    ]
 
-    has_photos = bool(target_ad.get("photos") or any(a.get("photos") for a in comparative_ads))
+    has_photos = bool(
+        target_ad.get("photos") or any(a.get("photos") for a in comparative_ads)
+    )
     photo_note = (
-        "\n\nFotos dos imóveis foram incluídas nesta análise. Avalie-as criteriosamente: "
-        "padrão de acabamento, estado de conservação, luminosidade, vista, tamanho real percebido "
-        "e quaisquer diferenciais ou problemas visíveis."
+        "\n\nFotos dos imóveis foram incluídas. Avalie-as criteriosamente: "
+        "padrão de acabamento, estado de conservação, luminosidade, vista, "
+        "tamanho real percebido e quaisquer diferenciais ou problemas visíveis."
     ) if has_photos else ""
 
-    target_block = _ad_text_block(target_ad, "ANÚNCIO ALVO")
-    comp_blocks = "\n".join(_ad_text_block(ad, f"COMPARATIVO {i+1}") for i, ad in enumerate(comparative_ads)) or "Nenhum comparativo adicionado."
-    online_blocks = "\n".join(_ad_text_block(l, f"ONLINE {i+1}") for i, l in enumerate(online_listings[:10])) or "Nenhuma busca online realizada."
+    target_block  = _ad_text_block(target_ad, "ANÚNCIO ALVO")
+    comp_blocks   = "\n".join(
+        _ad_text_block(ad, f"COMPARATIVO {i+1}") for i, ad in enumerate(comparative_ads)
+    ) or "Nenhum comparativo adicionado."
+    online_blocks = "\n".join(
+        _ad_text_block(l, f"ONLINE {i+1}") for i, l in enumerate(online_listings[:MAX_ONLINE_IN_PROMPT])
+    ) or "Nenhuma busca online realizada."
 
-    return f"""Você é um consultor imobiliário sênior especializado no mercado de Belo Horizonte. Realize uma ANÁLISE COMPETITIVA detalhada tendo o anúncio alvo como foco central.{photo_note}
+    return f"""Você é um consultor imobiliário sênior especializado no mercado de Belo Horizonte. \
+Realize uma ANÁLISE COMPETITIVA detalhada tendo o anúncio alvo como foco central.{photo_note}
 
 ## EDIFÍCIO DE REFERÊNCIA
 {building_key} — Belo Horizonte, MG
@@ -260,9 +349,9 @@ def _build_competitive_prompt(
 - Total de transações: {len(building_df)} | Período: {date_min} → {date_max}
 - R$/m² médio histórico: {f"R$ {avg_m2:,.0f}" if avg_m2 else "N/A"} | Mediana: {f"R$ {median_m2:,.0f}" if median_m2 else "N/A"}
 - Intervalo interquartil (P25–P75): {f"R$ {p25_m2:,.0f} – R$ {p75_m2:,.0f}" if p25_m2 and p75_m2 else "N/A"}
-- Transações últimos 2 anos: {len(recent)} | R$/m² médio recente: {f"R$ {recent_m2.mean():,.0f}" if not recent_m2.empty else "N/A"}
+- Transações últimos {ITBI_RECENT_YEARS} anos: {n_recent} | R$/m² médio recente: {f"R$ {recent_m2.mean():,.0f}" if not recent_m2.empty else "N/A"}
 
-Últimas 12 transações (unidades do edifício):
+Últimas {MAX_HIST_FOR_PROMPT} transações (unidades do edifício):
 {json.dumps(hist, ensure_ascii=False, indent=2)}
 
 ## ANÚNCIO ALVO
@@ -320,29 +409,45 @@ def _build_multimodal_content(
     comparative_ads: list[dict],
     provider: str,
 ) -> list:
-    content = []
+    """Build multimodal message content, capping total images at MAX_IMAGES_IN_PROMPT."""
+    content: list = []
+    images_sent = 0
 
-    def add_images(photos: list[dict], label: str):
-        if not photos:
+    def add_images(photos: list[dict], label: str) -> None:
+        nonlocal images_sent
+        if not photos or images_sent >= MAX_IMAGES_IN_PROMPT:
             return
-        if provider == "Claude":
-            content.append({"type": "text", "text": f"\n--- {label} ---"})
-            for p in photos:
+        remaining = MAX_IMAGES_IN_PROMPT - images_sent
+        batch = photos[:remaining]
+        content.append({"type": "text", "text": f"\n--- {label} ({len(batch)} foto(s)) ---"})
+        for p in batch:
+            if provider == "Claude":
                 content.append({
                     "type": "image",
                     "source": {"type": "base64", "media_type": p["media_type"], "data": p["data"]},
                 })
-        else:
-            content.append({"type": "text", "text": f"\n--- {label} ---"})
-            for p in photos:
+            else:
                 content.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:{p['media_type']};base64,{p['data']}"},
                 })
+        images_sent += len(batch)
 
-    add_images(target_ad.get("photos") or [], f"Fotos do anúncio alvo: {target_ad.get('title', '')}")
+    add_images(
+        target_ad.get("photos") or [],
+        f"Fotos do anúncio alvo: {target_ad.get('title', '')}",
+    )
     for i, ad in enumerate(comparative_ads):
-        add_images(ad.get("photos") or [], f"Fotos comparativo {i+1}: {ad.get('title', '')}")
+        add_images(
+            ad.get("photos") or [],
+            f"Fotos comparativo {i + 1}: {ad.get('title', '')}",
+        )
+
+    if images_sent >= MAX_IMAGES_IN_PROMPT:
+        content.append({
+            "type": "text",
+            "text": f"\n(Limite de {MAX_IMAGES_IN_PROMPT} imagens atingido. Imagens adicionais omitidas.)",
+        })
 
     content.append({"type": "text", "text": text_prompt})
     return content
@@ -357,24 +462,28 @@ def generate_competitive_analysis(
     model: str,
 ) -> str:
     text_prompt = _build_competitive_prompt(building_df, target_ad, comparative_ads, online_listings)
-    content = _build_multimodal_content(text_prompt, target_ad, comparative_ads, provider)
-
-    if provider == "Claude":
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": content}],
-        )
-        return response.content[0].text
-    else:
-        client = openai_lib.OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": content}],
-        )
-        return response.choices[0].message.content or ""
+    content     = _build_multimodal_content(text_prompt, target_ad, comparative_ads, provider)
+    try:
+        if provider == "Claude":
+            client   = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=model, max_tokens=4096,
+                messages=[{"role": "user", "content": content}],
+            )
+            return response.content[0].text
+        else:
+            client   = openai_lib.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=model, max_tokens=4096,
+                messages=[{"role": "user", "content": content}],
+            )
+            return response.choices[0].message.content or ""
+    except anthropic.AuthenticationError:
+        return "**Erro:** Anthropic API key inválida. Verifique a chave no painel lateral."
+    except openai_lib.AuthenticationError:
+        return "**Erro:** OpenAI API key inválida. Verifique a chave no painel lateral."
+    except Exception as exc:
+        return f"**Erro ao gerar análise:** {exc}"
 
 # ─── Charts ────────────────────────────────────────────────────────────────────
 
@@ -383,15 +492,10 @@ def build_yearly_avg_chart(building_df: pd.DataFrame) -> go.Figure:
     df["ano"] = df["ano"].astype(int)
     by_year = (
         df.groupby("ano")
-        .agg(
-            avg_total=("valor_declarado", "mean"),
-            avg_m2=("valor_m2", "mean"),
-            n=("valor_declarado", "count"),
-        )
+        .agg(avg_total=("valor_declarado", "mean"), avg_m2=("valor_m2", "mean"), n=("valor_declarado", "count"))
         .reset_index()
         .sort_values("ano")
     )
-
     fig = make_subplots(
         rows=1, cols=2,
         subplot_titles=("Valor médio total por ano (R$)", "Preço médio R$/m² por ano"),
@@ -419,10 +523,9 @@ def build_yearly_avg_chart(building_df: pd.DataFrame) -> go.Figure:
     fig.update_xaxes(dtick=1, tickformat="d")
     return fig
 
-
 def build_comparison_chart(
     building_df: pd.DataFrame,
-    target_ad: dict | None,
+    target_ad: Optional[dict],
     comparative_ads: list[dict],
     online_listings: list[dict],
 ) -> go.Figure:
@@ -466,15 +569,16 @@ def build_comparison_chart(
             y=[float(target_ad["price_m2"])],
             mode="markers+text",
             name="🎯 ALVO",
-            marker=dict(size=22, color="#F44336", symbol="star",
-                        line=dict(color="#000", width=2)),
+            marker=dict(size=22, color="#F44336", symbol="star", line=dict(color="#000", width=2)),
             text=[f"🎯 {target_ad.get('title', 'ALVO')[:30]}"],
             textposition="top center",
             textfont=dict(size=12, color="#F44336"),
-            hovertemplate=f"<b>🎯 ALVO: {target_ad.get('title', '')[:50]}</b><br>R$/m²: R$ %{{y:,.0f}}<extra></extra>",
+            hovertemplate=(
+                f"<b>🎯 ALVO: {target_ad.get('title', '')[:50]}</b>"
+                "<br>R$/m²: R$ %{y:,.0f}<extra></extra>"
+            ),
         ))
 
-    # Add horizontal reference lines for ITBI stats
     valid_m2 = building_df["valor_m2"].dropna()
     if not valid_m2.empty:
         median_val = valid_m2.median()
@@ -483,13 +587,13 @@ def build_comparison_chart(
             annotation_text=f"Mediana ITBI: R$ {median_val:,.0f}/m²",
             annotation_position="bottom right",
         )
-        recent_cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
+        recent_cutoff = now - pd.DateOffset(years=ITBI_RECENT_YEARS)
         recent = building_df[building_df["data_quitacao"] >= recent_cutoff]["valor_m2"].dropna()
-        if not recent.empty and len(recent) >= 3:
+        if len(recent) >= 3:
             recent_avg = recent.mean()
             fig.add_hline(
                 y=recent_avg, line_dash="dash", line_color="#FF7043", opacity=0.6,
-                annotation_text=f"Média ITBI recente (2a): R$ {recent_avg:,.0f}/m²",
+                annotation_text=f"Média ITBI recente ({ITBI_RECENT_YEARS}a): R$ {recent_avg:,.0f}/m²",
                 annotation_position="top right",
             )
 
@@ -505,31 +609,42 @@ def build_comparison_chart(
 
 # ─── Session state ─────────────────────────────────────────────────────────────
 
-def init_state():
+def init_state() -> None:
     defaults = {
-        "building_key": None,
-        "building_df": None,
+        "building_key":    None,
+        "building_df":     None,
         "online_listings": [],
         "comparative_ads": [],
-        "target_ad": None,
-        "analysis": None,
-        "market_summary": "",
-        "search_done": False,
+        "target_ad":       None,
+        "analysis":        None,
+        "market_summary":  "",
+        "search_done":     False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+    # Migrate legacy key from older sessions
+    if "saved_ads" in st.session_state and not st.session_state.get("comparative_ads"):
+        st.session_state["comparative_ads"] = st.session_state.pop("saved_ads")
 
-def fmt_r(val) -> str:
-    return f"R$ {val:,.0f}" if pd.notna(val) and val else "–"
+def _reset_building() -> None:
+    for k, v in {
+        "building_key": None, "building_df": None,
+        "online_listings": [], "comparative_ads": [],
+        "target_ad": None, "analysis": None,
+        "market_summary": "", "search_done": False,
+    }.items():
+        st.session_state[k] = v
 
-def fmt_m2(val) -> str:
-    return f"{val:.1f} m²" if pd.notna(val) and val else "–"
+# ─── UI components ─────────────────────────────────────────────────────────────
 
-def _ad_form(form_key: str, submit_label: str, title_placeholder: str = "Ex: Apto 302 – ZAP Imóveis"):
-    """Render a reusable ad input form. Returns (submitted: bool, ad_dict: dict)."""
+def _ad_form(
+    form_key: str,
+    submit_label: str,
+    title_placeholder: str = "Ex: Apto 302 – ZAP Imóveis",
+) -> tuple[bool, dict]:
+    """Render an ad input form. Returns (submitted, ad_dict)."""
     with st.form(form_key, clear_on_submit=True):
         r1c1, r1c2, r1c3 = st.columns(3)
         ad_title   = r1c1.text_input("Título / Referência *", placeholder=title_placeholder)
@@ -541,40 +656,56 @@ def _ad_form(form_key: str, submit_label: str, title_placeholder: str = "Ex: Apt
         ad_beds    = r2c2.number_input("Quartos", min_value=0, step=1, format="%d")
         ad_parking = r2c3.number_input("Vagas", min_value=0, step=1, format="%d")
 
-        ad_url     = st.text_input("Link do anúncio", placeholder="https://...")
-        ad_notes   = st.text_area("Observações / Diferenciais", placeholder="Ex: reformado, 2 suítes, vista livre, condomínio R$ 800/mês…")
-        ad_photos  = st.file_uploader(
-            "Fotos do imóvel",
+        ad_url   = st.text_input("Link do anúncio", placeholder="https://...")
+        ad_notes = st.text_area(
+            "Observações / Diferenciais",
+            placeholder="Ex: reformado, 2 suítes, vista livre, condomínio R$ 800/mês…",
+        )
+        ad_photos = st.file_uploader(
+            f"Fotos do imóvel (máx. {MAX_PHOTOS_PER_AD} arquivos · {MAX_IMAGE_MB:.0f} MB cada)",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
-            help="Adicione fotos para incluir análise visual no relatório (Claude e GPT-4o suportam imagens).",
+            help="Fotos são incluídas na análise visual pelo Claude/GPT-4o.",
         )
-
         submitted = st.form_submit_button(submit_label)
 
-    if submitted:
-        if not ad_title.strip():
-            st.warning("Preencha ao menos o título.")
-            return False, {}
-        pm2 = round(ad_price / ad_area, 2) if ad_area > 0 and ad_price > 0 else None
-        photos = [file_to_base64(f) for f in (ad_photos or [])]
-        ad = {
-            "title":    ad_title.strip(),
-            "price":    ad_price or None,
-            "area":     ad_area or None,
-            "price_m2": pm2,
-            "floor":    ad_floor.strip() or None,
-            "bedrooms": int(ad_beds) if ad_beds > 0 else None,
-            "parking":  int(ad_parking) if ad_parking > 0 else None,
-            "url":      ad_url.strip() or None,
-            "notes":    ad_notes.strip() or None,
-            "photos":   photos,
-        }
-        return True, ad
-    return False, {}
+    if not submitted:
+        return False, {}
 
-def _render_ad_card(ad: dict, idx: int, collection_key: str | None = None):
-    """Display an ad card in an expander. If collection_key is set, shows a remove button."""
+    if not ad_title.strip():
+        st.warning("Preencha ao menos o título.")
+        return False, {}
+
+    pm2 = round(ad_price / ad_area, 2) if ad_area > 0 and ad_price > 0 else None
+
+    raw_files = (ad_photos or [])[:MAX_PHOTOS_PER_AD]
+    photos = [r for f in raw_files if (r := file_to_base64(f)) is not None]
+
+    # Validate URL to prevent markdown injection
+    clean_url = ad_url.strip()
+    if clean_url and not is_valid_url(clean_url):
+        st.warning("URL inválida ignorada — use http:// ou https://")
+        clean_url = None
+
+    return True, {
+        "title":    ad_title.strip(),
+        "price":    ad_price or None,
+        "area":     ad_area or None,
+        "price_m2": pm2,
+        "floor":    ad_floor.strip() or None,
+        "bedrooms": int(ad_beds)    if ad_beds    > 0 else None,
+        "parking":  int(ad_parking) if ad_parking > 0 else None,
+        "url":      clean_url,
+        "notes":    ad_notes.strip() or None,
+        "photos":   photos,
+    }
+
+def _render_ad_card(
+    ad: dict,
+    idx: int,
+    collection_key: Optional[str] = None,
+) -> None:
+    """Display an ad card in an expander. Shows remove button when collection_key is set."""
     label = ad["title"]
     if ad.get("price"):
         label += f" — R$ {ad['price']:,.0f}"
@@ -583,17 +714,17 @@ def _render_ad_card(ad: dict, idx: int, collection_key: str | None = None):
 
     with st.expander(label, expanded=False):
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Preço", fmt_r(ad.get("price")))
-        c2.metric("Área", fmt_m2(ad.get("area")))
-        c3.metric("R$/m²", fmt_r(ad.get("price_m2")))
-        c4.metric("Andar", ad.get("floor") or "–")
+        c1.metric("Preço",  fmt_r(ad.get("price")))
+        c2.metric("Área",   fmt_m2(ad.get("area")))
+        c3.metric("R$/m²",  fmt_r(ad.get("price_m2")))
+        c4.metric("Andar",  ad.get("floor") or "–")
 
         if ad.get("bedrooms") or ad.get("parking"):
             b1, b2 = st.columns(2)
             b1.write(f"**Quartos:** {ad.get('bedrooms') or '–'}")
             b2.write(f"**Vagas:** {ad.get('parking') or '–'}")
 
-        if ad.get("url"):
+        if ad.get("url") and is_valid_url(ad["url"]):
             st.markdown(f"[🔗 Ver anúncio]({ad['url']})")
         if ad.get("notes"):
             st.caption(f"📝 {ad['notes']}")
@@ -612,7 +743,7 @@ def _render_ad_card(ad: dict, idx: int, collection_key: str | None = None):
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     init_state()
 
     # ── Sidebar ────────────────────────────────────────────────────────────────
@@ -620,18 +751,18 @@ def main():
         st.header("⚙️ Configurações")
 
         provider = st.radio("Provedor de IA", options=["Claude", "GPT"], horizontal=True)
+        model    = st.selectbox("Modelo", CLAUDE_MODELS if provider == "Claude" else GPT_MODELS)
 
-        if provider == "Claude":
-            api_key = st.text_input("Anthropic API Key", type="password",
-                                    value=os.environ.get("ANTHROPIC_API_KEY", ""))
-            model = st.selectbox("Modelo", CLAUDE_MODELS)
-        else:
-            api_key = st.text_input("OpenAI API Key", type="password",
-                                    value=os.environ.get("OPENAI_API_KEY", ""))
-            model = st.selectbox("Modelo", GPT_MODELS)
+        key_label = "Anthropic API Key" if provider == "Claude" else "OpenAI API Key"
+        api_key   = st.text_input(
+            key_label,
+            type="password",
+            value=get_default_api_key(provider),
+            help="Configurável via st.secrets (Streamlit Cloud) ou variável de ambiente.",
+        )
 
         if not api_key:
-            st.warning("Insira sua API key para busca online e análise.")
+            st.warning("Insira a API key para habilitar busca e análise.")
         else:
             st.success(f"{provider} — {model}")
 
@@ -641,39 +772,32 @@ def main():
         if st.session_state.building_key:
             st.divider()
             st.caption(f"**Edifício ativo:**\n{st.session_state.building_key}")
-
-            # Quick status
             has_target = st.session_state.target_ad is not None
             n_comps    = len(st.session_state.comparative_ads)
             st.caption(
-                f"{'✅' if has_target else '⬜'} Anúncio alvo  |  "
+                f"{'✅' if has_target else '⬜'} Anúncio alvo  ·  "
                 f"{n_comps} comparativo(s)"
             )
-
-            if st.button("Limpar tudo"):
-                for k, v in {
-                    "building_key": None, "building_df": None,
-                    "online_listings": [], "comparative_ads": [],
-                    "target_ad": None, "analysis": None,
-                    "market_summary": "", "search_done": False,
-                }.items():
-                    st.session_state[k] = v
+            if st.button("🗑 Limpar tudo", use_container_width=True):
+                _reset_building()
                 st.rerun()
 
     # ── Header ─────────────────────────────────────────────────────────────────
     st.title("🏠 ITBI BH — Análise Competitiva de Imóveis")
     st.caption(
-        "Encontrou um apartamento de interesse? Pesquise o edifício, defina o anúncio alvo, "
-        "adicione comparativos e gere uma análise competitiva completa com IA."
+        "Encontrou um apartamento de interesse? Pesquise o edifício na base ITBI, "
+        "defina o **anúncio alvo**, adicione comparativos e gere uma análise competitiva completa com IA."
     )
 
     df = load_data()
+    if df is None:
+        st.stop()
 
     # ── 1. Busca ───────────────────────────────────────────────────────────────
     st.subheader("1. Buscar edifício na base ITBI")
     query = st.text_input(
         "Endereço",
-        placeholder="Ex: PATAGONIA 1023  ou  AV AFONSO PENA  ou  RUA GUAJAJARAS",
+        placeholder="Ex: PATAGONIA 1023  ou  AV AFONSO PENA  ou  GUAJAJARAS",
         label_visibility="collapsed",
     )
     buildings = search_buildings(df, query) if query else []
@@ -686,18 +810,18 @@ def main():
             st.write("")
             st.write("")
             if st.button("Selecionar", type="primary", use_container_width=True):
-                bdf = get_building_df(df, selected_building)
-                st.session_state.building_key    = selected_building
-                st.session_state.building_df     = bdf
-                st.session_state.online_listings = []
-                st.session_state.comparative_ads = []
-                st.session_state.target_ad       = None
-                st.session_state.analysis        = None
-                st.session_state.market_summary  = ""
-                st.session_state.search_done     = False
+                st.session_state.building_df = get_building_df(df, selected_building)
+                st.session_state.building_key = selected_building
+                # Reset dependent state
+                for k in ("online_listings", "comparative_ads"):
+                    st.session_state[k] = []
+                for k in ("target_ad", "analysis"):
+                    st.session_state[k] = None
+                st.session_state.market_summary = ""
+                st.session_state.search_done    = False
                 st.rerun()
     elif query and len(query) >= 3:
-        st.warning("Nenhum edifício encontrado. Tente só o nome da rua sem número.")
+        st.info("Nenhum edifício encontrado. Tente só o nome da rua sem número.")
 
     if not st.session_state.building_key or st.session_state.building_df is None:
         return
@@ -705,28 +829,28 @@ def main():
     bdf     = st.session_state.building_df
     bkey    = st.session_state.building_key
     n_total = len(bdf)
-    n_units = bdf["endereco"].nunique()
 
     if n_total == 0:
         st.warning("Nenhuma transação encontrada para este edifício.")
         return
 
-    # ── 2. Overview ────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader(f"2. Overview ITBI — {bkey}")
-
+    n_units     = bdf["endereco"].nunique()
     latest      = bdf.iloc[0]
     valid_m2    = bdf["valor_m2"].dropna()
     valid_total = bdf["valor_declarado"].dropna()
     date_min    = bdf["data_quitacao"].min()
     date_max    = bdf["data_quitacao"].max()
 
+    # ── 2. Overview ────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader(f"2. Overview ITBI — {bkey}")
+
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Transações", n_total)
-    k2.metric("Unidades únicas", n_units)
-    k3.metric("Período", f"{str(date_min)[:7]} → {str(date_max)[:7]}")
-    k4.metric("Última venda", str(latest["data_quitacao"])[:10] if pd.notna(latest["data_quitacao"]) else "–")
-    k5.metric("R$/m² médio histórico", fmt_r(valid_m2.mean()) if not valid_m2.empty else "–")
+    k1.metric("Transações",           n_total)
+    k2.metric("Unidades únicas",      n_units)
+    k3.metric("Período",              f"{str(date_min)[:7]} → {str(date_max)[:7]}")
+    k4.metric("Última venda",         str(latest["data_quitacao"])[:10] if pd.notna(latest["data_quitacao"]) else "–")
+    k5.metric("R$/m² médio histórico",fmt_r(valid_m2.mean())    if not valid_m2.empty    else "–")
     k6.metric("Valor médio histórico", fmt_r(valid_total.mean()) if not valid_total.empty else "–")
 
     st.plotly_chart(build_yearly_avg_chart(bdf), use_container_width=True)
@@ -736,24 +860,29 @@ def main():
         st.markdown("**Top 5 — Maiores valores declarados**")
         top5_price = (
             bdf.dropna(subset=["valor_declarado"]).nlargest(5, "valor_declarado")
-            [["data_quitacao","endereco","valor_declarado","valor_m2","area_construida_adquirida"]]
-            .rename(columns={"data_quitacao":"Data","endereco":"Unidade",
-                              "valor_declarado":"Valor (R$)","valor_m2":"R$/m²",
-                              "area_construida_adquirida":"Área (m²)"})
+            [["data_quitacao", "endereco", "valor_declarado", "valor_m2", "area_construida_adquirida"]]
+            .rename(columns={
+                "data_quitacao": "Data", "endereco": "Unidade",
+                "valor_declarado": "Valor (R$)", "valor_m2": "R$/m²",
+                "area_construida_adquirida": "Área (m²)",
+            })
         )
         top5_price["Data"]       = top5_price["Data"].dt.strftime("%d/%m/%Y")
         top5_price["Valor (R$)"] = top5_price["Valor (R$)"].apply(lambda v: f"R$ {v:,.0f}" if pd.notna(v) else "–")
         top5_price["R$/m²"]      = top5_price["R$/m²"].apply(lambda v: f"R$ {v:,.0f}" if pd.notna(v) else "–")
         top5_price["Área (m²)"]  = top5_price["Área (m²)"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "–")
         st.dataframe(top5_price, use_container_width=True, hide_index=True)
+
     with col_rec:
         st.markdown("**Top 5 — Transações mais recentes**")
         top5_rec = (
             bdf.dropna(subset=["data_quitacao"]).head(5)
-            [["data_quitacao","endereco","valor_declarado","valor_m2","area_construida_adquirida"]]
-            .rename(columns={"data_quitacao":"Data","endereco":"Unidade",
-                              "valor_declarado":"Valor (R$)","valor_m2":"R$/m²",
-                              "area_construida_adquirida":"Área (m²)"})
+            [["data_quitacao", "endereco", "valor_declarado", "valor_m2", "area_construida_adquirida"]]
+            .rename(columns={
+                "data_quitacao": "Data", "endereco": "Unidade",
+                "valor_declarado": "Valor (R$)", "valor_m2": "R$/m²",
+                "area_construida_adquirida": "Área (m²)",
+            })
         )
         top5_rec["Data"]       = top5_rec["Data"].dt.strftime("%d/%m/%Y")
         top5_rec["Valor (R$)"] = top5_rec["Valor (R$)"].apply(lambda v: f"R$ {v:,.0f}" if pd.notna(v) else "–")
@@ -763,23 +892,20 @@ def main():
 
     # Full filterable table
     st.markdown("**Tabela completa**")
-    fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 2])
+    fc1, fc2, fc3, fc4 = st.columns(4)
     years = sorted(bdf["ano"].dropna().astype(int).unique().tolist())
     year_range = fc1.select_slider(
         "Ano", options=years,
         value=(years[0], years[-1]) if len(years) >= 2 else (years[0], years[0]),
     ) if years else None
-    tipos = ["Todos"] + sorted(bdf["descricao_tipo_ocupacao_unidade"].dropna().unique().tolist())
-    tipo_sel = fc2.selectbox("Tipo de ocupação", tipos)
-    andares = ["Todos"] + sorted(bdf["andar"].dropna().astype(str).unique().tolist())
-    andar_sel = fc3.selectbox("Andar", andares)
-    blocos = ["Todos"] + sorted(bdf["bloco"].dropna().astype(str).unique().tolist())
-    bloco_sel = fc4.selectbox("Bloco", blocos)
+    tipo_sel  = fc2.selectbox("Tipo", ["Todos"] + sorted(bdf["descricao_tipo_ocupacao_unidade"].dropna().unique().tolist()))
+    andar_sel = fc3.selectbox("Andar", ["Todos"] + sorted(bdf["andar"].dropna().astype(str).unique().tolist()))
+    bloco_sel = fc4.selectbox("Bloco", ["Todos"] + sorted(bdf["bloco"].dropna().astype(str).unique().tolist()))
 
     fdf = bdf.copy()
     if year_range:
         fdf = fdf[fdf["ano"].between(year_range[0], year_range[1])]
-    if tipo_sel != "Todos":
+    if tipo_sel  != "Todos":
         fdf = fdf[fdf["descricao_tipo_ocupacao_unidade"] == tipo_sel]
     if andar_sel != "Todos":
         fdf = fdf[fdf["andar"].astype(str) == andar_sel]
@@ -799,11 +925,11 @@ def main():
     st.dataframe(
         display_df, use_container_width=True, hide_index=True,
         column_config={
-            "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-            "Valor declarado (R$)": st.column_config.NumberColumn("Valor declarado (R$)", format="R$ %.0f"),
-            "Base cálculo (R$)": st.column_config.NumberColumn("Base cálculo (R$)", format="R$ %.0f"),
-            "R$/m²": st.column_config.NumberColumn("R$/m²", format="R$ %.0f"),
-            "Área (m²)": st.column_config.NumberColumn("Área (m²)", format="%.1f m²"),
+            "Data":                st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+            "Valor declarado (R$)":st.column_config.NumberColumn("Valor declarado (R$)", format="R$ %.0f"),
+            "Base cálculo (R$)":   st.column_config.NumberColumn("Base cálculo (R$)",    format="R$ %.0f"),
+            "R$/m²":               st.column_config.NumberColumn("R$/m²",                format="R$ %.0f"),
+            "Área (m²)":           st.column_config.NumberColumn("Área (m²)",            format="%.1f m²"),
         },
         height=380,
     )
@@ -811,10 +937,7 @@ def main():
     # ── 3. Anúncio alvo ────────────────────────────────────────────────────────
     st.divider()
     st.subheader("3. 🎯 Anúncio alvo")
-    st.caption(
-        "Cadastre o apartamento que você quer avaliar. "
-        "Ele será o foco central da análise competitiva."
-    )
+    st.caption("Cadastre o apartamento que você quer avaliar — ele é o foco central da análise.")
 
     if st.session_state.target_ad:
         st.success(f"**Alvo definido:** {st.session_state.target_ad['title']}")
@@ -824,7 +947,7 @@ def main():
             st.session_state.analysis  = None
             st.rerun()
     else:
-        st.info("Nenhum anúncio alvo definido. Preencha abaixo:")
+        st.info("Nenhum anúncio alvo definido ainda.")
         submitted, ad = _ad_form(
             "form_target",
             "🎯 Definir como anúncio alvo",
@@ -838,10 +961,7 @@ def main():
     # ── 4. Anúncios comparativos ───────────────────────────────────────────────
     st.divider()
     st.subheader("4. Anúncios comparativos")
-    st.caption(
-        "Adicione outros apartamentos do mercado para servir de base na análise competitiva. "
-        "Quanto mais comparativos, mais preciso o posicionamento."
-    )
+    st.caption("Adicione outros apartamentos do mercado para servir de base na análise competitiva.")
 
     submitted_comp, new_comp = _ad_form(
         "form_comparative",
@@ -854,13 +974,13 @@ def main():
         st.rerun()
 
     if st.session_state.comparative_ads:
-        st.write(f"**{len(st.session_state.comparative_ads)} comparativo(s) adicionado(s):**")
+        st.write(f"**{len(st.session_state.comparative_ads)} comparativo(s):**")
         for i, ad in enumerate(st.session_state.comparative_ads):
             _render_ad_card(ad, idx=i, collection_key="comparative_ads")
     else:
         st.caption("Nenhum comparativo ainda.")
 
-    # ── 5. Anúncios online ─────────────────────────────────────────────────────
+    # ── 5. Busca online ────────────────────────────────────────────────────────
     st.divider()
     st.subheader("5. Busca online de mercado")
     st.caption("Busca adicional via IA + DuckDuckGo para enriquecer o contexto de mercado.")
@@ -868,23 +988,26 @@ def main():
     col_btn, col_info = st.columns([2, 5])
     with col_btn:
         if st.button(
-            f"🔍 Buscar online com {provider}",
+            f"🔍 Buscar com {provider}",
             type="secondary",
             disabled=not api_key,
-            help=f"Requer API key {provider}" if not api_key else f"DuckDuckGo + {model}",
+            help="Requer API key" if not api_key else f"DuckDuckGo + {model}",
         ):
             with st.spinner(f"{provider} ({model}) buscando anúncios online..."):
                 listings, summary = search_listings(bkey, provider, api_key, model)
                 st.session_state.online_listings = listings
                 st.session_state.market_summary  = summary
                 st.session_state.search_done     = True
-            st.rerun()
+            if summary.startswith("Erro"):
+                st.error(summary)
+            else:
+                st.rerun()
     with col_info:
         if not api_key:
-            st.info(f"Configure a API Key do {provider} no painel lateral.")
+            st.info("Configure a API Key no painel lateral.")
 
     if st.session_state.search_done:
-        if st.session_state.market_summary:
+        if st.session_state.market_summary and not st.session_state.market_summary.startswith("Erro"):
             st.info(f"**Resumo de mercado:** {st.session_state.market_summary}")
         listings = st.session_state.online_listings
         if listings:
@@ -895,18 +1018,18 @@ def main():
                     ca.write(f"**{l.get('title', f'Anúncio {i+1}')}**")
                     price, area, pm2 = l.get("price"), l.get("area"), l.get("price_m2")
                     cb.metric("Preço", f"R$ {price:,.0f}" if price else "–")
-                    cc.metric("Área", f"{area:.0f} m²" if area else "–")
-                    cd.metric("R$/m²", f"R$ {pm2:,.0f}" if pm2 else "–")
-                    if l.get("url"):
-                        st.markdown(f"[🔗 Ver anúncio]({l['url']})")
+                    cc.metric("Área",  f"{area:.0f} m²"   if area  else "–")
+                    cd.metric("R$/m²", f"R$ {pm2:,.0f}"   if pm2   else "–")
+                    url = l.get("url", "")
+                    if url and is_valid_url(url):
+                        st.markdown(f"[🔗 Ver anúncio]({url})")
                     if l.get("description"):
                         st.caption(l["description"])
         else:
-            st.warning("Nenhum anúncio estruturado retornado pela busca online.")
+            st.warning("Nenhum anúncio estruturado retornado. Adicione comparativos manualmente acima.")
 
-    # ── Gráfico comparativo ────────────────────────────────────────────────────
-    if (st.session_state.target_ad or st.session_state.comparative_ads
-            or st.session_state.online_listings):
+    # ── Comparison chart ───────────────────────────────────────────────────────
+    if st.session_state.target_ad or st.session_state.comparative_ads or st.session_state.online_listings:
         st.divider()
         st.plotly_chart(
             build_comparison_chart(
@@ -931,14 +1054,15 @@ def main():
         n_photos_total = len(target.get("photos") or []) + sum(
             len(a.get("photos") or []) for a in comps
         )
-        col_meta = st.columns(4)
-        col_meta[0].metric("Alvo", target["title"][:30])
-        col_meta[1].metric("Comparativos", len(comps))
-        col_meta[2].metric("Anúncios online", len(st.session_state.online_listings))
-        col_meta[3].metric("Fotos para análise visual", n_photos_total)
+        images_to_send = min(n_photos_total, MAX_IMAGES_IN_PROMPT)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Alvo",               target["title"][:28])
+        m2.metric("Comparativos",        len(comps))
+        m3.metric("Anúncios online",     len(st.session_state.online_listings))
+        m4.metric("Fotos p/ análise IA", f"{images_to_send}/{n_photos_total}")
 
         if not api_key:
-            st.info(f"Configure a API Key do {provider} no painel lateral para gerar a análise.")
+            st.info("Configure a API Key no painel lateral para gerar a análise.")
         else:
             if st.button(
                 f"🤖 Gerar análise competitiva com {provider} ({model})",

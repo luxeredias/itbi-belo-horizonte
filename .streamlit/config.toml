@@ -1,0 +1,13 @@
+[theme]
+primaryColor       = "#1976D2"
+backgroundColor    = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor          = "#1A1A2E"
+font               = "sans serif"
+
+[server]
+maxUploadSize      = 10          # MB — fotos por upload
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats   = false

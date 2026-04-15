@@ -1,3 +1,6 @@
+# Secrets — nunca versionar
+.streamlit/secrets.toml
+
 # Data — todos os CSVs (o parquet é o arquivo de produção)
 *.csv
 
