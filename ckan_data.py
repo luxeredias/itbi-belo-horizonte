@@ -9,6 +9,7 @@ Field-name schema variants across resources are detected per-resource.
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -95,6 +96,60 @@ def _get_resources() -> list[tuple[str, str, str, str]]:
     return _resource_cache[1]
 
 
+# ─── Address parsing helpers ──────────────────────────────────────────────────
+
+def _parse_apt(endereco: str) -> tuple[int | None, int | None, int | None]:
+    """
+    Extract (andar, unidade, bloco) from a Brazilian apartment address.
+    Convention: APT 1403 → andar=14, unidade=3  |  APT 12 → andar=1, unidade=2
+    """
+    m = re.search(r'APT\s+(\d+)', endereco)
+    b = re.search(r'BLOCO\s+(\d+)', endereco)
+
+    if m:
+        num = m.group(1)
+        if len(num) > 2:
+            andar   = int(num[:-2])
+            unidade = int(num[-2:])  # keep last 2 digits as unit number
+        elif len(num) == 2:
+            andar   = int(num[0])
+            unidade = int(num[1])
+        else:
+            andar   = 0
+            unidade = int(num)
+    else:
+        andar, unidade = None, None
+
+    bloco = int(b.group(1)) if b else None
+    return andar, unidade, bloco
+
+
+def _build_apt_key(endereco: str, andar: int | None, unidade: int | None, bloco: int | None) -> str | None:
+    """Build a unique apartment key string from address components."""
+    apt_match   = re.search(r'APT\s+(\d+)', endereco)
+    bloco_match = re.search(r'BLOCO\s+(\d+)', endereco)
+
+    apt_part = ""
+    if apt_match:
+        apt_part = f"APT {apt_match.group(1)}"
+    elif andar is not None and unidade is not None:
+        apt_part = f"APT {andar}{unidade:02d}"
+    elif andar is not None:
+        apt_part = f"ANDAR {andar}"
+    elif unidade is not None:
+        apt_part = f"UNIDADE {unidade}"
+
+    bloco_part = ""
+    if bloco_match:
+        bloco_part = f"BLOCO {bloco_match.group(1)}"
+    elif bloco is not None:
+        bloco_part = f"BLOCO {bloco}"
+
+    if apt_part and bloco_part:
+        return f"{apt_part} {bloco_part}"
+    return apt_part or bloco_part or None
+
+
 # ─── Parsing helpers ───────────────────────────────────────────────────────────
 
 def _parse_brl(s: Any) -> float | None:
@@ -148,6 +203,9 @@ def _normalize(rec: dict, addr_field: str, date_field: str, ano_field: str) -> d
     valor_m2     = (v_decl / area_c) if (v_decl and area_c and area_c > 0) else None
     building_key = endereco.split(" - ")[0].strip() if " - " in endereco else endereco
 
+    andar, unidade, bloco = _parse_apt(endereco)
+    apt_key = _build_apt_key(endereco, andar, unidade, bloco)
+
     return {
         "id":                              rec.get("_id"),
         "endereco":                        endereco,
@@ -168,12 +226,11 @@ def _normalize(rec: dict, addr_field: str, date_field: str, ano_field: str) -> d
         "mes":                             int(dt.month)        if dt is not None else None,
         "ano_mes":                         dt.strftime("%Y-%m") if dt is not None else None,
         "valor_m2":                        valor_m2,
-        # Not available via API — kept for schema compatibility
-        "andar":                           None,
-        "unidade":                         None,
-        "bloco":                           None,
-        "apt_key":                         None,
-        "revendido":                       None,
+        "andar":                           andar,
+        "unidade":                         unidade,
+        "bloco":                           bloco,
+        "apt_key":                         apt_key,
+        "revendido":                       None,   # computed at DataFrame level in get_building_df
         "building_key":                    building_key,
         "building_key_norm":               building_key.upper(),
     }
@@ -250,4 +307,9 @@ def get_building_df(building_key: str) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(filtered)
     df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
+
+    # revendido: apt_key that appears more than once was sold again
+    contagem = df["apt_key"].value_counts()
+    df["revendido"] = df["apt_key"].map(lambda x: bool(contagem.get(x, 0) > 1) if x is not None else False)
+
     return df.sort_values("data_quitacao", ascending=False).reset_index(drop=True)
