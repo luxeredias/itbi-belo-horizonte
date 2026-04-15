@@ -2,12 +2,14 @@
 CKAN Data Layer — Prefeitura de Belo Horizonte ITBI API
 Fetches live ITBI transaction data from dados.pbh.gov.br
 
-All 23 resources (01/2008–current) are queried in parallel.
-Three field-name schema variants are handled transparently.
+Resources are discovered dynamically from the CKAN package metadata
+(cached for 24 h) so new monthly releases are picked up automatically.
+Field-name schema variants across resources are detected per-resource.
 """
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import urlencode
@@ -15,48 +17,83 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
-CKAN_API_BASE = "https://dados.pbh.gov.br/api/3/action/datastore_search"
-_HEADERS = {"User-Agent": "ITBI-BH-App/1.0"}
-_MAX_WORKERS = 10
+_CKAN_BASE      = "https://dados.pbh.gov.br/api/3/action"
+CKAN_API_BASE   = f"{_CKAN_BASE}/datastore_search"
+_PACKAGE_ID     = "itbi-relatorios"
+_HEADERS        = {"User-Agent": "ITBI-BH-App/1.0"}
+_MAX_WORKERS    = 10
 _REQUEST_TIMEOUT = 20
-_FETCH_LIMIT = 32000  # max records per resource per query
+_FETCH_LIMIT    = 32000   # max records per resource per query
+_RESOURCE_TTL   = 86_400  # re-discover resources every 24 h
 
-# ─── Resource registry ─────────────────────────────────────────────────────────
-# Columns: (resource_id, addr_field, date_field, ano_construcao_field)
-#
-# Schema A — historical + Jun 2024:
-#   addr="Endereco"  date="Data Quitacao Transacao"  ano="Ano de Construcao Unidade"
-# Schema B — Jul 2024 – Feb 2026:
-#   addr="Endereco"  date="Data Quitacao"             ano="Ano de Construcao (Unidade)"
-# Schema C — Mar 2026:
-#   addr="Endereco Completo"  date="Data Quitacao"    ano="Ano de Construcao (Unidade)"
+# ─── Resource discovery ────────────────────────────────────────────────────────
+# Instead of a hardcoded list, we ask CKAN which CSV resources exist and
+# detect the field-name schema of each one.  Results are cached in memory
+# for _RESOURCE_TTL seconds so new monthly files are picked up automatically.
 
-RESOURCES: list[tuple[str, str, str, str]] = [
-    # resource_id                              addr_field          date_field                   ano_field
-    ("7f8955aa-0b30-4157-bbc2-7dd444941728", "Endereco",          "Data Quitacao Transacao",   "Ano de Construcao Unidade"),        # 01/2008–05/2024
-    ("b21f9785-6b4c-43a1-bd66-dbf89e63efe7", "Endereco",          "Data Quitacao Transacao",   "Ano de Construcao Unidade"),        # Jun 2024
-    ("1520a5dc-858a-4eca-89bd-54964c273ce7", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Jul 2024
-    ("aa948bd0-9554-4e33-87f7-eb61ef0d2903", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Aug 2024
-    ("f582a331-9608-49a2-be3b-a5a5aa19ecff", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Sep 2024
-    ("f5c13859-c3ee-4e3e-9c34-c6215f49a4a5", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Oct 2024
-    ("97db6e95-141a-4402-aa60-50dd06ae9340", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Nov 2024
-    ("af6d7c58-e1d2-4fab-8d9a-487dddc30a20", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Dec 2024
-    ("78c33612-ebf5-4a25-af35-d3065f056579", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Jan 2025
-    ("23e019f9-6537-4561-9935-ca7d19ae3b6b", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Feb 2025
-    ("df8c42ee-166f-4e5d-9eb3-69fc00f3ae57", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Mar 2025
-    ("dad2d5af-d9c2-4e09-9766-7f01387fbd9a", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Apr 2025
-    ("0e353102-585d-4dfb-ab15-84550b550c61", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # May 2025
-    ("6be6874d-6e20-4d68-a904-2351fc0f31f4", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Jun 2025
-    ("9f8b1538-5f8b-469c-8728-f4902b28456e", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Jul 2025
-    ("f4e60a70-3bd8-41dc-b031-42b5f3d1671a", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Aug 2025
-    ("cbdea14d-77de-4c32-a7db-3e327e09257c", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Sep 2025
-    ("fbd1fe60-f838-4392-92c2-98cc09dfc81c", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Oct 2025
-    ("9bd075e2-2abe-42d7-a1e2-b68a18245172", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Nov 2025
-    ("c3dd25fd-ac34-4f3f-afcc-21589d64ce8a", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Dec 2025
-    ("2deb4632-f226-40a7-b8ac-89c6d9f8aff9", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Jan 2026
-    ("453b3f6d-ec7f-415c-af5e-c23d1f488e2a", "Endereco",          "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Feb 2026
-    ("0773a6b9-b107-4692-9b85-760221ec3abb", "Endereco Completo", "Data Quitacao",             "Ano de Construcao (Unidade)"),      # Mar 2026
-]
+_resource_cache: tuple[float, list[tuple[str, str, str, str]]] | None = None
+
+
+def _detect_schema(resource_id: str) -> tuple[str, str, str] | None:
+    """
+    Call datastore_search with limit=0 to read field names, then return
+    (addr_field, date_field, ano_construcao_field).
+    Returns None if the resource is unavailable.
+    """
+    params = {"resource_id": resource_id, "limit": 0}
+    url = CKAN_API_BASE + "?" + urlencode(params)
+    req = Request(url, headers=_HEADERS)
+    try:
+        with urlopen(req, timeout=_REQUEST_TIMEOUT) as f:
+            data = json.loads(f.read())
+        fields = {fld["id"] for fld in data["result"]["fields"]}
+
+        addr = "Endereco Completo" if "Endereco Completo" in fields else "Endereco"
+        date = "Data Quitacao Transacao" if "Data Quitacao Transacao" in fields else "Data Quitacao"
+        ano  = "Ano de Construcao Unidade" if "Ano de Construcao Unidade" in fields else "Ano de Construcao (Unidade)"
+        return addr, date, ano
+    except Exception:
+        return None
+
+
+def _fetch_resource_list() -> list[tuple[str, str, str, str]]:
+    """
+    Query package_show for the ITBI dataset, filter active CSV resources,
+    and detect the schema of each one in parallel.
+    Returns list of (resource_id, addr_field, date_field, ano_field).
+    """
+    url = f"{_CKAN_BASE}/package_show?id={_PACKAGE_ID}"
+    req = Request(url, headers=_HEADERS)
+    with urlopen(req, timeout=_REQUEST_TIMEOUT) as f:
+        pkg = json.loads(f.read())
+
+    csv_ids = [
+        r["id"]
+        for r in pkg["result"]["resources"]
+        if r.get("format", "").upper() == "CSV" and r.get("datastore_active", False)
+    ]
+
+    result: list[tuple[str, str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        future_to_id = {executor.submit(_detect_schema, rid): rid for rid in csv_ids}
+        for future, rid in future_to_id.items():
+            schema = future.result()
+            if schema:
+                result.append((rid, *schema))
+    return result
+
+
+def _get_resources() -> list[tuple[str, str, str, str]]:
+    """
+    Return the cached resource list, refreshing if older than _RESOURCE_TTL.
+    Thread-safe for Streamlit's single-threaded execution model.
+    """
+    global _resource_cache
+    now = time.monotonic()
+    if _resource_cache is None or (now - _resource_cache[0]) >= _RESOURCE_TTL:
+        _resource_cache = (now, _fetch_resource_list())
+    return _resource_cache[1]
+
 
 # ─── Parsing helpers ───────────────────────────────────────────────────────────
 
@@ -71,7 +108,7 @@ def _parse_brl(s: Any) -> float | None:
 
 
 def _parse_date(s: Any) -> pd.Timestamp | None:
-    """Parse 'DD/MM/YYYY' → pd.Timestamp (NaT on failure)"""
+    """Parse 'DD/MM/YYYY' → pd.Timestamp (None on failure)"""
     if not s:
         return None
     ts = pd.to_datetime(str(s), dayfirst=True, errors="coerce")
@@ -101,15 +138,15 @@ def _normalize(rec: dict, addr_field: str, date_field: str, ano_field: str) -> d
         or rec.get("Ano de Construcao (Unidade)")
         or rec.get("Ano de Construcao Unidade")
     )
-    padrao = (
-        str(rec.get("Padrao Acabamento (Unidade)") or rec.get("Padrao Acabamento Unidade") or "").strip()
-    )
-    tipo_ocup = (
-        str(rec.get("Descricao Tipo Ocupacao (Unidade)") or rec.get("Descricao Tipo Ocupacao Unidade") or "").strip()
-    )
+    padrao = str(
+        rec.get("Padrao Acabamento (Unidade)") or rec.get("Padrao Acabamento Unidade") or ""
+    ).strip()
+    tipo_ocup = str(
+        rec.get("Descricao Tipo Ocupacao (Unidade)") or rec.get("Descricao Tipo Ocupacao Unidade") or ""
+    ).strip()
 
-    valor_m2      = (v_decl / area_c) if (v_decl and area_c and area_c > 0) else None
-    building_key  = endereco.split(" - ")[0].strip() if " - " in endereco else endereco
+    valor_m2     = (v_decl / area_c) if (v_decl and area_c and area_c > 0) else None
+    building_key = endereco.split(" - ")[0].strip() if " - " in endereco else endereco
 
     return {
         "id":                              rec.get("_id"),
@@ -127,9 +164,9 @@ def _normalize(rec: dict, addr_field: str, date_field: str, ano_field: str) -> d
         "valor_base_calculo":              v_base,
         "zona_uso":                        str(rec.get("Zona Uso ITBI") or "").strip(),
         "data_quitacao":                   dt,
-        "ano":                             int(dt.year)          if dt is not None else None,
-        "mes":                             int(dt.month)         if dt is not None else None,
-        "ano_mes":                         dt.strftime("%Y-%m")  if dt is not None else None,
+        "ano":                             int(dt.year)         if dt is not None else None,
+        "mes":                             int(dt.month)        if dt is not None else None,
+        "ano_mes":                         dt.strftime("%Y-%m") if dt is not None else None,
         "valor_m2":                        valor_m2,
         # Not available via API — kept for schema compatibility
         "andar":                           None,
@@ -165,13 +202,15 @@ def _fetch_one(resource_id: str, addr_field: str, date_field: str, ano_field: st
 
 def fetch_all_matching(query: str) -> list[dict]:
     """
-    Query all resources in parallel for addresses containing `query`.
+    Query all active resources in parallel for addresses containing `query`.
+    Resource list is refreshed from CKAN every 24 h automatically.
     Returns a list of normalized record dicts.
     """
+    resources = _get_resources()
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         futures = [
             executor.submit(_fetch_one, rid, af, df, ano_f, query)
-            for rid, af, df, ano_f in RESOURCES
+            for rid, af, df, ano_f in resources
         ]
         results: list[dict] = []
         for future in as_completed(futures):
@@ -182,7 +221,7 @@ def fetch_all_matching(query: str) -> list[dict]:
 def search_building_names(query: str) -> list[str]:
     """
     Return sorted unique building names (address up to first ' - ')
-    from all resources where the address contains `query`.
+    from all active resources where the address contains `query`.
     Requires at least 3 characters.
     """
     if len(query.strip()) < 3:
@@ -194,7 +233,7 @@ def search_building_names(query: str) -> list[str]:
 
 def get_building_df(building_key: str) -> pd.DataFrame:
     """
-    Fetch all ITBI records for `building_key` from every resource.
+    Fetch all ITBI records for `building_key` from every active resource.
     Client-side filters to exact building prefix to prevent false positives
     (e.g. 'PATAGONIA 200' matching 'PATAGONIA 2001').
     Returns a DataFrame sorted by data_quitacao descending.
