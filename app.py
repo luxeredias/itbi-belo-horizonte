@@ -2,6 +2,8 @@
 ITBI BH — Análise Competitiva de Imóveis
 Streamlit app for competitive real-estate analysis using official
 ITBI transaction data from the Prefeitura de Belo Horizonte.
+
+Data source: Portal de Dados Abertos BH — dados.pbh.gov.br (live API)
 """
 from __future__ import annotations
 
@@ -19,9 +21,10 @@ import streamlit as st
 from duckduckgo_search import DDGS
 from plotly.subplots import make_subplots
 
+import ckan_data
+
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-DATA_PATH            = os.path.join(os.path.dirname(__file__), "itbi_2008_2026.parquet")
 MAX_PHOTOS_PER_AD    = 6      # photos stored per listing
 MAX_IMAGES_IN_PROMPT = 8      # images sent to LLM (cost/token guard)
 MAX_IMAGE_MB         = 4.0    # max size per uploaded image
@@ -59,46 +62,24 @@ def get_default_api_key(provider: str) -> str:
         pass
     return os.environ.get(key, "")
 
-# ─── Data loading ──────────────────────────────────────────────────────────────
+# ─── CKAN API wrappers (cached) ────────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Carregando base ITBI (501 k transações)...")
-def load_data() -> Optional[pd.DataFrame]:
-    if not os.path.exists(DATA_PATH):
-        st.error(
-            f"Arquivo de dados não encontrado: `{DATA_PATH}`. "
-            "Certifique-se de que `itbi_2008_2026.parquet` está na raiz do repositório."
-        )
-        return None
-    try:
-        df = pd.read_parquet(DATA_PATH)
-        df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
-        for col in (
-            "valor_declarado", "valor_base_calculo", "valor_m2",
-            "area_construida_adquirida", "area_adquirida_unidades_somadas",
-        ):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["building_key"]      = df["endereco"].str.split(" - ").str[0].str.strip()
-        df["building_key_norm"] = df["building_key"].str.upper()
-        return df
-    except Exception as exc:
-        st.error(f"Erro ao carregar base de dados: {exc}")
-        return None
+@st.cache_data(
+    ttl=3600,
+    show_spinner="Buscando edifícios na API da Prefeitura BH...",
+)
+def search_buildings(query: str) -> list[str]:
+    """Return sorted unique building names matching `query` via CKAN API."""
+    return ckan_data.search_building_names(query)
 
-# ─── Search helpers ────────────────────────────────────────────────────────────
 
-def search_buildings(df: pd.DataFrame, query: str) -> list[str]:
-    q = query.upper().strip()
-    if len(q) < 3:
-        return []
-    mask = df["building_key_norm"].str.contains(q, na=False, regex=False)
-    return sorted(df[mask]["building_key"].dropna().unique().tolist())
-
-def get_building_df(df: pd.DataFrame, building_key: str) -> pd.DataFrame:
-    return (
-        df[df["building_key"] == building_key]
-        .sort_values("data_quitacao", ascending=False)
-        .reset_index(drop=True)
-    )
+@st.cache_data(
+    ttl=1800,
+    show_spinner="Carregando transações ITBI em tempo real...",
+)
+def get_building_df(building_key: str) -> pd.DataFrame:
+    """Fetch all ITBI records for `building_key` from CKAN API."""
+    return ckan_data.get_building_df(building_key)
 
 # ─── Validation helpers ────────────────────────────────────────────────────────
 
@@ -767,7 +748,7 @@ def main() -> None:
             st.success(f"{provider} — {model}")
 
         st.divider()
-        st.caption("**Base:** ITBI BH 2008–2026 · Prefeitura BH")
+        st.caption("**Fonte:** ITBI BH · Prefeitura BH (dados em tempo real)")
 
         if st.session_state.building_key:
             st.divider()
@@ -786,12 +767,9 @@ def main() -> None:
     st.title("🏠 ITBI BH — Análise Competitiva de Imóveis")
     st.caption(
         "Encontrou um apartamento de interesse? Pesquise o edifício na base ITBI, "
-        "defina o **anúncio alvo**, adicione comparativos e gere uma análise competitiva completa com IA."
+        "defina o **anúncio alvo**, adicione comparativos e gere uma análise competitiva completa com IA. "
+        "Dados em tempo real via API da Prefeitura BH."
     )
-
-    df = load_data()
-    if df is None:
-        st.stop()
 
     # ── 1. Busca ───────────────────────────────────────────────────────────────
     st.subheader("1. Buscar edifício na base ITBI")
@@ -800,7 +778,7 @@ def main() -> None:
         placeholder="Ex: PATAGONIA 1023  ou  AV AFONSO PENA  ou  GUAJAJARAS",
         label_visibility="collapsed",
     )
-    buildings = search_buildings(df, query) if query else []
+    buildings = search_buildings(query) if query and len(query.strip()) >= 3 else []
 
     if buildings:
         col_sel, col_btn = st.columns([5, 1])
@@ -810,7 +788,7 @@ def main() -> None:
             st.write("")
             st.write("")
             if st.button("Selecionar", type="primary", use_container_width=True):
-                st.session_state.building_df = get_building_df(df, selected_building)
+                st.session_state.building_df = get_building_df(selected_building)
                 st.session_state.building_key = selected_building
                 # Reset dependent state
                 for k in ("online_listings", "comparative_ads"):
@@ -820,8 +798,10 @@ def main() -> None:
                 st.session_state.market_summary = ""
                 st.session_state.search_done    = False
                 st.rerun()
-    elif query and len(query) >= 3:
+    elif query and len(query.strip()) >= 3 and not buildings:
         st.info("Nenhum edifício encontrado. Tente só o nome da rua sem número.")
+    elif query and len(query.strip()) < 3:
+        st.caption("Digite ao menos 3 caracteres para buscar.")
 
     if not st.session_state.building_key or st.session_state.building_df is None:
         return
