@@ -308,8 +308,12 @@ def get_building_df(building_key: str) -> pd.DataFrame:
     df = pd.DataFrame(filtered)
     df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
 
-    # revendido: apt_key that appears more than once was sold again
-    contagem = df["apt_key"].value_counts()
-    df["revendido"] = df["apt_key"].map(lambda x: bool(contagem.get(x, 0) > 1) if x is not None else False)
+    # revendido: mesmo apt_key no mesmo endereço (building_key) vendido mais de uma vez
+    composite = df["building_key_norm"].str.cat(df["apt_key"].fillna(""), sep="|")
+    contagem  = composite.value_counts()
+    df["revendido"] = (
+        composite.map(lambda x: contagem[x] > 1)
+        & df["apt_key"].notna()
+    )
 
     return df.sort_values("data_quitacao", ascending=False).reset_index(drop=True)
