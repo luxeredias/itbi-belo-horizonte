@@ -36,6 +36,8 @@ MAX_ONLINE_IN_PROMPT = 10     # online listings included in AI prompt
 
 CLAUDE_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
 GPT_MODELS    = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+GROQ_MODELS   = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+GROQ_API_BASE = "https://api.groq.com/openai/v1"
 
 # ─── Page config ───────────────────────────────────────────────────────────────
 
@@ -55,13 +57,21 @@ st.set_page_config(
 
 def get_default_api_key(provider: str) -> str:
     """Return API key from st.secrets (Streamlit Cloud) or env var (local dev)."""
-    key = "ANTHROPIC_API_KEY" if provider == "Claude" else "OPENAI_API_KEY"
+    key_map = {"Claude": "ANTHROPIC_API_KEY", "GPT": "OPENAI_API_KEY", "Groq": "GROQ_API_KEY"}
+    key = key_map.get(provider, "")
     try:
         if key in st.secrets:
             return st.secrets[key]
     except Exception:
         pass
     return os.environ.get(key, "")
+
+
+def _openai_client(provider: str, api_key: str) -> openai_lib.OpenAI:
+    """Return an OpenAI-compatible client; uses Groq base URL when provider is Groq."""
+    if provider == "Groq":
+        return openai_lib.OpenAI(api_key=api_key, base_url=GROQ_API_BASE)
+    return openai_lib.OpenAI(api_key=api_key)
 
 # ─── Parquet fallback ──────────────────────────────────────────────────────────
 
@@ -250,8 +260,8 @@ def _search_listings_claude(address: str, api_key: str, model: str) -> tuple[lis
             messages.append({"role": "user", "content": tool_results})
     return [], "Limite de buscas atingido."
 
-def _search_listings_gpt(address: str, api_key: str, model: str) -> tuple[list[dict], str]:
-    client = openai_lib.OpenAI(api_key=api_key)
+def _search_listings_gpt(address: str, api_key: str, model: str, provider: str = "GPT") -> tuple[list[dict], str]:
+    client = _openai_client(provider, api_key)
     tools = [{
         "type": "function",
         "function": {
@@ -291,7 +301,7 @@ def search_listings(
     try:
         if provider == "Claude":
             return _search_listings_claude(address, api_key, model)
-        return _search_listings_gpt(address, api_key, model)
+        return _search_listings_gpt(address, api_key, model, provider)
     except anthropic.AuthenticationError:
         return [], "Erro: Anthropic API key inválida."
     except openai_lib.AuthenticationError:
@@ -332,6 +342,7 @@ def _build_competitive_prompt(
     target_ad: dict,
     comparative_ads: list[dict],
     online_listings: list[dict],
+    vision: bool = True,
 ) -> str:
     building_key = building_df["building_key"].iloc[0] if len(building_df) > 0 else "N/A"
 
@@ -362,11 +373,19 @@ def _build_competitive_prompt(
     has_photos = bool(
         target_ad.get("photos") or any(a.get("photos") for a in comparative_ads)
     )
-    photo_note = (
-        "\n\nFotos dos imóveis foram incluídas. Avalie-as criteriosamente: "
-        "padrão de acabamento, estado de conservação, luminosidade, vista, "
-        "tamanho real percebido e quaisquer diferenciais ou problemas visíveis."
-    ) if has_photos else ""
+    if has_photos and vision:
+        photo_note = (
+            "\n\nFotos dos imóveis foram incluídas. Avalie-as criteriosamente: "
+            "padrão de acabamento, estado de conservação, luminosidade, vista, "
+            "tamanho real percebido e quaisquer diferenciais ou problemas visíveis."
+        )
+    elif has_photos and not vision:
+        photo_note = (
+            "\n\n(Fotos foram enviadas mas o modelo selecionado não suporta análise de imagens. "
+            "Baseie o item 'Acabamento e conservação' nas observações textuais.)"
+        )
+    else:
+        photo_note = ""
 
     target_block  = _ad_text_block(target_ad, "ANÚNCIO ALVO")
     comp_blocks   = "\n".join(
@@ -446,7 +465,11 @@ def _build_multimodal_content(
     comparative_ads: list[dict],
     provider: str,
 ) -> list:
-    """Build multimodal message content, capping total images at MAX_IMAGES_IN_PROMPT."""
+    """Build multimodal message content, capping total images at MAX_IMAGES_IN_PROMPT.
+    Groq does not support vision — images are omitted and only text is returned."""
+    if provider == "Groq":
+        return [{"type": "text", "text": text_prompt}]
+
     content: list = []
     images_sent = 0
 
@@ -498,7 +521,8 @@ def generate_competitive_analysis(
     api_key: str,
     model: str,
 ) -> str:
-    text_prompt = _build_competitive_prompt(building_df, target_ad, comparative_ads, online_listings)
+    vision      = provider != "Groq"
+    text_prompt = _build_competitive_prompt(building_df, target_ad, comparative_ads, online_listings, vision)
     content     = _build_multimodal_content(text_prompt, target_ad, comparative_ads, provider)
     try:
         if provider == "Claude":
@@ -509,7 +533,7 @@ def generate_competitive_analysis(
             )
             return response.content[0].text
         else:
-            client   = openai_lib.OpenAI(api_key=api_key)
+            client   = _openai_client(provider, api_key)
             response = client.chat.completions.create(
                 model=model, max_tokens=4096,
                 messages=[{"role": "user", "content": content}],
@@ -787,21 +811,35 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Configurações")
 
-        provider = st.radio("Provedor de IA", options=["Claude", "GPT"], horizontal=True)
-        model    = st.selectbox("Modelo", CLAUDE_MODELS if provider == "Claude" else GPT_MODELS)
-
-        key_label = "Anthropic API Key" if provider == "Claude" else "OpenAI API Key"
-        api_key   = st.text_input(
-            key_label,
-            type="password",
-            value=get_default_api_key(provider),
-            help="Configurável via st.secrets (Streamlit Cloud) ou variável de ambiente.",
+        provider = st.radio(
+            "Provedor de IA",
+            options=["Groq", "Claude", "GPT"],
+            format_func=lambda p: "Groq (gratuito)" if p == "Groq" else p,
+            horizontal=True,
         )
 
-        if not api_key:
-            st.warning("Insira a API key para habilitar busca e análise.")
+        if provider == "Groq":
+            model   = st.selectbox("Modelo", GROQ_MODELS)
+            api_key = get_default_api_key("Groq")
+            if api_key:
+                st.success(f"Groq — {model}")
+                st.caption("Análise de fotos requer Claude ou GPT.")
+            else:
+                st.warning("Chave Groq não configurada nos secrets.")
         else:
-            st.success(f"{provider} — {model}")
+            model_list = CLAUDE_MODELS if provider == "Claude" else GPT_MODELS
+            model      = st.selectbox("Modelo", model_list)
+            key_label  = "Anthropic API Key" if provider == "Claude" else "OpenAI API Key"
+            api_key    = st.text_input(
+                key_label,
+                type="password",
+                value=get_default_api_key(provider),
+                help="Configurável via st.secrets ou variável de ambiente.",
+            )
+            if not api_key:
+                st.warning("Insira a API key para habilitar busca e análise.")
+            else:
+                st.success(f"{provider} — {model}")
 
         st.divider()
         st.caption("**Fonte:** ITBI BH · Prefeitura BH (dados em tempo real)")
@@ -1095,7 +1133,10 @@ def main() -> None:
         m1.metric("Alvo",               target["title"][:28])
         m2.metric("Comparativos",        len(comps))
         m3.metric("Anúncios online",     len(st.session_state.online_listings))
-        m4.metric("Fotos p/ análise IA", f"{images_to_send}/{n_photos_total}")
+        if provider == "Groq":
+            m4.metric("Fotos p/ análise IA", "—", help="Groq não suporta visão. Use Claude ou GPT.")
+        else:
+            m4.metric("Fotos p/ análise IA", f"{images_to_send}/{n_photos_total}")
 
         if not api_key:
             st.info("Configure a API Key no painel lateral para gerar a análise.")
