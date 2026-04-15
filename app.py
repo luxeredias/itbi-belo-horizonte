@@ -25,6 +25,7 @@ import ckan_data
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
+DATA_PATH            = os.path.join(os.path.dirname(__file__), "itbi_2008_2026.parquet")
 MAX_PHOTOS_PER_AD    = 6      # photos stored per listing
 MAX_IMAGES_IN_PROMPT = 8      # images sent to LLM (cost/token guard)
 MAX_IMAGE_MB         = 4.0    # max size per uploaded image
@@ -62,15 +63,63 @@ def get_default_api_key(provider: str) -> str:
         pass
     return os.environ.get(key, "")
 
-# ─── CKAN API wrappers (cached) ────────────────────────────────────────────────
+# ─── Parquet fallback ──────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner="Carregando base ITBI local (fallback)...")
+def _load_parquet() -> Optional[pd.DataFrame]:
+    if not os.path.exists(DATA_PATH):
+        return None
+    try:
+        df = pd.read_parquet(DATA_PATH)
+        df["data_quitacao"] = pd.to_datetime(df["data_quitacao"], errors="coerce")
+        for col in (
+            "valor_declarado", "valor_base_calculo", "valor_m2",
+            "area_construida_adquirida", "area_adquirida_unidades_somadas",
+        ):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["building_key"]      = df["endereco"].str.split(" - ").str[0].str.strip()
+        df["building_key_norm"] = df["building_key"].str.upper()
+        return df
+    except Exception:
+        return None
+
+
+def _parquet_search(query: str) -> list[str]:
+    df = _load_parquet()
+    if df is None:
+        return []
+    q = query.upper().strip()
+    mask = df["building_key_norm"].str.contains(q, na=False, regex=False)
+    return sorted(df[mask]["building_key"].dropna().unique().tolist())
+
+
+def _parquet_building_df(building_key: str) -> pd.DataFrame:
+    df = _load_parquet()
+    if df is None:
+        return pd.DataFrame()
+    return (
+        df[df["building_key"] == building_key]
+        .sort_values("data_quitacao", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# ─── CKAN API wrappers with parquet fallback (cached) ──────────────────────────
 
 @st.cache_data(
     ttl=3600,
     show_spinner="Buscando edifícios na API da Prefeitura BH...",
 )
 def search_buildings(query: str) -> list[str]:
-    """Return sorted unique building names matching `query` via CKAN API."""
-    return ckan_data.search_building_names(query)
+    """Search via CKAN API; falls back to local parquet on error or empty result."""
+    try:
+        results = ckan_data.search_building_names(query)
+        if results:
+            return results
+    except Exception:
+        pass
+    st.toast("API indisponível — usando base local (2008–2026).", icon="⚠️")
+    return _parquet_search(query)
 
 
 @st.cache_data(
@@ -78,8 +127,15 @@ def search_buildings(query: str) -> list[str]:
     show_spinner="Carregando transações ITBI em tempo real...",
 )
 def get_building_df(building_key: str) -> pd.DataFrame:
-    """Fetch all ITBI records for `building_key` from CKAN API."""
-    return ckan_data.get_building_df(building_key)
+    """Fetch from CKAN API; falls back to local parquet on error or empty result."""
+    try:
+        result = ckan_data.get_building_df(building_key)
+        if not result.empty:
+            return result
+    except Exception:
+        pass
+    st.toast("API indisponível — usando base local (2008–2026).", icon="⚠️")
+    return _parquet_building_df(building_key)
 
 # ─── Validation helpers ────────────────────────────────────────────────────────
 
