@@ -426,6 +426,8 @@ Gere a ANÁLISE COMPETITIVA completa em markdown com os headers abaixo:
 ### Posicionamento de Preço
 Calcule e apresente em tabela o R$/m² do anúncio alvo vs cada comparativo vs mediana ITBI vs média recente.
 Mostre o desvio percentual em cada caso. Veredicto claro: o preço está ACIMA / NA LINHA / ABAIXO do mercado.
+Tenha em mente que o m2 da tabela ITBI é relativo à área privada + fração ideal do condomínio. 
+Muitas vezes, o m2 dos anúncios são apenas da área privada. Tenha em conta um fator de 50% da área total do apartamento para o cálculo do m2.
 
 ### Score Competitivo (0–10)
 Atribua uma nota justificada para o anúncio alvo em:
