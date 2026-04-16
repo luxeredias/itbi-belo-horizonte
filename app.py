@@ -26,6 +26,7 @@ import ckan_data
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
 DATA_PATH            = os.path.join(os.path.dirname(__file__), "itbi_2008_2026.parquet")
+SAVES_DIR            = os.path.join(os.path.dirname(__file__), "saves")
 MAX_PHOTOS_PER_AD    = 6      # photos stored per listing
 MAX_IMAGES_IN_PROMPT = 8      # images sent to LLM (cost/token guard)
 MAX_IMAGE_MB         = 4.0    # max size per uploaded image
@@ -700,6 +701,76 @@ def _reset_building() -> None:
     }.items():
         st.session_state[k] = v
 
+# ─── Local search persistence ─────────────────────────────────────────────────
+
+def _ensure_saves_dir() -> str:
+    os.makedirs(SAVES_DIR, exist_ok=True)
+    return SAVES_DIR
+
+def save_search(name: str) -> str:
+    """Persist current session search to a JSON file. Returns the saved file path."""
+    _ensure_saves_dir()
+    state = {
+        "saved_at":        pd.Timestamp.now().isoformat(timespec="seconds"),
+        "name":            name,
+        "building_key":    st.session_state.building_key,
+        "target_ad":       st.session_state.target_ad,
+        "comparative_ads": st.session_state.comparative_ads,
+        "online_listings": st.session_state.online_listings,
+        "market_summary":  st.session_state.market_summary,
+        "analysis":        st.session_state.analysis,
+    }
+    safe = name.replace("/", "_").replace("\\", "_").strip()[:50]
+    filename = f"{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}_{safe}.json"
+    path = os.path.join(SAVES_DIR, filename)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+    return path
+
+def list_saved_searches() -> list[dict]:
+    """Return saved search metadata sorted newest-first."""
+    saves_dir = _ensure_saves_dir()
+    results = []
+    for fn in sorted(os.listdir(saves_dir), reverse=True):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(saves_dir, fn)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            results.append({
+                "filename":    fn,
+                "path":        path,
+                "name":        data.get("name", fn),
+                "saved_at":    data.get("saved_at", ""),
+                "building_key":data.get("building_key", ""),
+                "has_target":  data.get("target_ad") is not None,
+                "n_comps":     len(data.get("comparative_ads") or []),
+            })
+        except Exception:
+            continue
+    return results
+
+def load_saved_search(path: str) -> None:
+    """Restore session state from a saved JSON file."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    bkey = data.get("building_key")
+    st.session_state.building_key    = bkey
+    st.session_state.building_df     = get_building_df(bkey) if bkey else None
+    st.session_state.target_ad       = data.get("target_ad")
+    st.session_state.comparative_ads = data.get("comparative_ads") or []
+    st.session_state.online_listings = data.get("online_listings") or []
+    st.session_state.market_summary  = data.get("market_summary") or ""
+    st.session_state.analysis        = data.get("analysis")
+    st.session_state.search_done     = bool(data.get("online_listings"))
+
+def delete_saved_search(path: str) -> None:
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
 # ─── UI components ─────────────────────────────────────────────────────────────
 
 def _ad_form(
@@ -858,6 +929,40 @@ def main() -> None:
             if st.button("🗑 Limpar tudo", use_container_width=True):
                 _reset_building()
                 st.rerun()
+
+        st.divider()
+        with st.expander("💾 Salvar / 📂 Carregar pesquisa"):
+            if st.session_state.building_key:
+                save_name = st.text_input(
+                    "Nome da pesquisa",
+                    value=st.session_state.building_key[:50],
+                    key="save_name_input",
+                )
+                if st.button("💾 Salvar pesquisa atual", use_container_width=True):
+                    saved_path = save_search(save_name or st.session_state.building_key)
+                    st.success(f"Salvo: {os.path.basename(saved_path)}")
+                st.caption("")
+
+            saved_list = list_saved_searches()
+            if saved_list:
+                st.markdown("**Pesquisas salvas:**")
+                for s in saved_list:
+                    with st.container(border=True):
+                        st.caption(
+                            f"**{s['name']}**  \n"
+                            f"{s['saved_at'][:16].replace('T', ' ')} · {s['building_key']}  \n"
+                            f"{'🎯 alvo' if s['has_target'] else ''}  "
+                            f"{s['n_comps']} comp."
+                        )
+                        btn_load, btn_del = st.columns(2)
+                        if btn_load.button("📂 Carregar", key=f"load_{s['filename']}", use_container_width=True):
+                            load_saved_search(s["path"])
+                            st.rerun()
+                        if btn_del.button("🗑 Apagar", key=f"delsaved_{s['filename']}", use_container_width=True):
+                            delete_saved_search(s["path"])
+                            st.rerun()
+            else:
+                st.caption("Nenhuma pesquisa salva ainda.")
 
     # ── Header ─────────────────────────────────────────────────────────────────
     st.title("🏠 ITBI BH — Análise Competitiva de Imóveis")
